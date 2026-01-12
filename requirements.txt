@@ -1,0 +1,23 @@
+# Dynamic Trip Planner Dependencies
+# Install with: pip install -r requirements.txt
+
+langchain
+langgraph
+
+langchain-qdrant
+qdrant-client
+
+langchain-community
+langchain-text-splitters
+
+sentence-transformers
+pypdf
+numpy
+
+# FastAPI server
+fastapi
+uvicorn
+
+# LLM provider
+langchain-google-genai
+
