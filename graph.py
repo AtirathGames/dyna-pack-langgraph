@@ -20,6 +20,9 @@ from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage, SystemMessage
+from langchain.agents import create_agent
+from langchain.agents.structured_output import ProviderStrategy
+
 
 from pydantic import BaseModel, Field
 from stategraph import TripPlannerState, Phase, DraftItinerary
@@ -377,12 +380,23 @@ If updating the draft, provide the FULL updated draft object, not just diffs."""
     
     try:
         # Use structured output for robust parsing
-        structured_llm = get_llm().with_structured_output(ExplorationOutput)
-        result = structured_llm.invoke(messages)
+        agent = create_agent(
+    model=get_llm(),
+    tools=[],  # no tools needed here (Qdrant already handled outside)
+    response_format=ExplorationOutput,
         
-        assistant_response = result.response
-        extracted = result.extracted_params.model_dump(exclude_none=True)
-        draft = result.draft if result.draft else {}
+)
+        result = agent.invoke({
+    "messages": [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_message}
+    ]
+})
+        structured = result["structured_response"]
+        
+        assistant_response = structured.response
+        extracted = structured.extracted_params.model_dump(exclude_none=True)
+        draft = structured.draft if structured.draft else {}
         
         # Update core requirements with extracted params
         if core:

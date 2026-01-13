@@ -12,8 +12,71 @@ from typing import Any, TypedDict, List, Dict, Optional, Literal, Required
 from pydantic import BaseModel, Field, ConfigDict, field_validator
 from enum import Enum
 from dataclasses import dataclass, field
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 import json
+
+
+# ============================================================
+# UTILITY: FlexibleDateTime parser
+# ============================================================
+class FlexibleDateTime:
+    """
+    Utility to parse datetime from various formats (ISO, timestamps, etc.)
+    Used by ItineraryPlan validators.
+    """
+
+    @staticmethod
+    def parse(value: Any) -> Optional[datetime]:
+        """
+        Parse a value into a datetime object.
+        Supports:
+        - datetime objects (pass through)
+        - ISO 8601 strings (e.g., "2026-03-10T09:15:00")
+        - date objects (convert to datetime at midnight)
+        - timestamps (int/float)
+        """
+        if isinstance(value, datetime):
+            return value
+
+        if isinstance(value, date):
+            return datetime.combine(value, datetime.min.time())
+
+        if isinstance(value, str):
+            # Try ISO 8601 format
+            try:
+                # Handle with/without timezone
+                if "T" in value:
+                    # Try with timezone first
+                    for fmt in [
+                        "%Y-%m-%dT%H:%M:%S%z",
+                        "%Y-%m-%dT%H:%M:%S.%f%z",
+                        "%Y-%m-%dT%H:%M:%S",
+                        "%Y-%m-%dT%H:%M:%S.%f",
+                        "%d-%m-%YT%H:%M:%S",
+                        "%d-%m-%YT%H:%M:%S.%f",
+                    ]:
+                        try:
+                            return datetime.strptime(value, fmt)
+                        except ValueError:
+                            continue
+                # Try date-only format
+                for fmt in ["%Y-%m-%d", "%d-%m-%Y"]:
+                    try:
+                        return datetime.strptime(value, fmt)
+                    except ValueError:
+                        continue
+                return datetime.strptime(value, "%Y-%m-%d")
+            except ValueError:
+                pass
+
+        if isinstance(value, (int, float)):
+            # Assume Unix timestamp
+            try:
+                return datetime.fromtimestamp(value)
+            except (ValueError, OSError):
+                pass
+
+        return None
 
 
 # ============================================================
@@ -52,7 +115,37 @@ class CoreRequirements(TypedDict, total=False):
     end_date: str
     budget_total: int
     travelers: int  # Total count (deprecated - use pax breakdown instead)
-    type_of_trip: str 
+    type_of_trip: str
+
+
+# Preferences for each category (loaded only when needed)
+class HotelPreferences(TypedDict):
+    location: Required[str]
+    hotel_name:Optional[str]
+    country: Optional[str]
+    hotel_budget:Optional[int]
+    star_rating: Optional[int]
+    amenities: Optional[List[str]]  # ["pool", "beach-access", "wifi"]
+    location_preference: Optional[str]  # "city-center", "beachside", "quiet"
+
+
+class FlightPreferences(TypedDict, total=False):
+    budget: Optional[int]
+    preferred_time: Optional[str]  # "morning", "evening", "any"
+    departure_date: Required[str]
+    departure_city: Required[str]
+    arrival_city: Required[str]
+    flight_preference: Optional[str]
+    class_preference: Optional[str]  # "economy", "business"
+    pax_adults: Optional[int]
+    pax_children: Optional[int]
+    pax_infants: Optional[int]
+
+
+class ActivityPreferences(TypedDict, total=False):
+    types: List[str]  # ["water-sports", "sightseeing", "relaxation"]
+    intensity: str  # "relaxed", "moderate", "packed"
+    must_do: List[str]  # Activities user specifically wants
 
 
 # Draft itinerary - ideas, not real bookings
@@ -74,9 +167,52 @@ class DraftItinerary(TypedDict, total=False):
     flight_type: str
 
 
+# Verified options - real data from APIs
+class VerifiedHotel(TypedDict):
+    id: str
+    name: str
+    total_price: int
+    rating: float
+    amenities: List[str]
+    location: str
+    available: bool
 
 
+class VerifiedFlight(TypedDict):
+    id: str
+    airline: str
+    flight_number: str
+    departure_time: str
+    arrival_time: str
+    price: int
+    stops: int
+    available: bool
 
+
+class VerifiedActivity(TypedDict):
+    id: str
+    name: str
+    operator: str
+    price: int
+    duration: str
+    day_suggested: int
+    available: bool
+
+
+class VerifiedCab(TypedDict):
+    id: str
+    type: str  # "airport-pickup", "day-rental", "point-to-point"
+    provider: str
+    price: int
+    available: bool
+
+
+class VerifiedOptions(TypedDict, total=False):
+    hotels: List[VerifiedHotel]
+    flights_outbound: List[VerifiedFlight]
+    flights_return: List[VerifiedFlight]
+    activities: List[VerifiedActivity]
+    cabs: List[VerifiedCab]
 
 
 FlightsRole = Literal["user", "assistant", "tool"]
@@ -140,6 +276,7 @@ class FlightSelection(TypedDict, total=False):
     selected_option_id: Optional[str]   # if tool provides an id
     selected_index: Optional[int]       # 1-based index shown to user
     selected_key: Optional[str]         # e.g., "Flight 7" (if raw_response uses keys)
+    selected_display_key: Optional[str] # e.g., "Flight 2" in filtered/renumbered view
     flight: Any                         # FULL flight dict/object from raw_response
     selected_at: Optional[str]          # ISO 8601
 
@@ -177,6 +314,9 @@ class FlightSearchRecord(TypedDict, total=False):
     # tool output for THIS LEG
     raw_response: Any
     result_count: int
+
+    # UI / presentation state for THIS LEG (helps map "Option N" back to raw_response)
+    presented_source_keys: Optional[List[str]]  # e.g., ["Flight 12", "Flight 3", ...] in the order shown
 
     # selections for THIS LEG (append-only)
     selections: List[FlightSelection]
@@ -282,6 +422,7 @@ class HotelSelection(TypedDict, total=False):
     """
     selected_index: Optional[int]       # 1-based index shown to user
     selected_key: Optional[str]         # e.g., "Hotel 1" (key from raw_response)
+    selected_display_key: Optional[str] # e.g., "Hotel 2" in filtered/renumbered view
     hotel: HotelInfo                    # FULL hotel dict from raw_response
     selected_at: Optional[str]          # ISO 8601
 
@@ -395,11 +536,9 @@ class AttractionSearchRecord(TypedDict, total=False):
 
     raw_response: Any  # store tool payload as-is (list/dict/etc)
 
-    # Normalized view (best for UI + LLM): "Attraction 1", "Attraction 2", ...
-    attractions: Dict[str, AttractionInfo]
-
     result_count: int
     created_at: str  # ISO 8601 string
+    selections: List["AttractionSelection"]  # append-only selections for THIS search
     error: Optional[str]
 
 
@@ -408,11 +547,11 @@ class AttractionSelection(TypedDict, total=False):
     A user selection from a prior search.
     IMPORTANT: Only selected attractions go here (not all results).
     """
-    search_key: str                  # e.g., "Search 1"
-    search_id: str
     selected_key: Optional[str]      # e.g., "Attraction 3"
+    selected_display_key: Optional[str]  # e.g., "Attraction 1" in renumbered view
+    selected_source_index: Optional[int] # original 1-based index if tool returned a list
     selected_index: Optional[int]    # 1-based index shown to user
-    metadata: Dict[str, Any]         # at least {"name": "..."}; can include more
+    attraction: Any                  # FULL attraction dict/object from raw_response
     selected_at: Optional[str]       # ISO 8601 string
 
 
@@ -422,22 +561,16 @@ class AttractionsState(TypedDict, total=False):
 
     Key points:
     - searches keeps all results (append-only)
-    - selected keeps ONLY user-picked items (multi-select supported)
+    - selections are stored per-search under searches["Search N"]["selections"]
     """
     conversation: List[AttractionsConversationMessage]
 
     searches: Dict[str, AttractionSearchRecord]  # keys: "Search 1", "Search 2", ...
     latest_search_key: Optional[str]
 
-    # MULTI-SELECTION: only the picks
-    selected: Optional[List[AttractionSelection]]
-
     latest_error: Optional[str]
     should_end_conversation: Optional[bool]
     ended_at: Optional[str]  # ISO 8601 string
-
-
-
 
 
 #============================Itineary JSON======================================
@@ -587,6 +720,18 @@ class TransfersConversationMessage(TypedDict, total=False):
     timestamp: Optional[str]  # ISO 8601
 
 
+# ----------------------------
+# Trip Planner (orchestrator) conversation
+# ----------------------------
+TripPlannerRole = Literal["user", "assistant"]
+
+
+class TripPlannerConversationMessage(TypedDict, total=False):
+    role: TripPlannerRole
+    content: str
+    timestamp: Optional[str]  # ISO 8601
+
+
 class TransferAddonInfo(TypedDict, total=False):
     type: Optional[str]
     price: Optional[float]
@@ -636,6 +781,7 @@ class TransferSelection(TypedDict, total=False):
     - No derived metadata required to reconstruct the selection.
     """
     selected_key: Optional[str]            # e.g., "Vehicle 2"
+    selected_display_key: Optional[str]    # e.g., "Vehicle 1" in filtered/renumbered view
     selected_index: Optional[int]          # 1-based index shown to user
     vehicle: Any                           # FULL vehicle dict/object from raw_response
     selected_at: Optional[str]             # ISO 8601
@@ -684,7 +830,7 @@ class TransfersState(TypedDict, total=False):
 # ----------------------------
 # Activities
 # ----------------------------
-ActivityType = Literal["meal", "sightseeing",""]
+ActivityType = Literal["sightseeing"]
 
 
 class Activity(BaseModel):
@@ -695,10 +841,203 @@ class Activity(BaseModel):
     location: str
     description: str
 
-    # Optional fields depending on activity type
-    meal: Optional[str] = None
-    attraction: Optional[str] = None
+    attraction: str
 
+
+TimelineItemType = Literal[
+    "arrival",
+    "transfer",
+    "check_in",
+    "check_out",
+    "activity",
+]
+
+TransportMode = Literal[
+    "airport_transfer",
+]
+
+class ActivityTimelineItem(BaseModel):
+    """Timeline item for activities/attractions.
+
+    REQUIRED fields:
+    - type: must be "activity"
+    - title: activity/attraction name
+    - description: brief description
+    - start_time: start time in HH:MM format (e.g., "09:00")
+    - end_time: end time in HH:MM format (e.g., "12:00")
+
+    DO NOT include: duration_minutes, transport_mode, time, or any other fields
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["activity"]
+    title: str
+    description: str = ""
+    start_time: str  # Required: HH:MM format
+    end_time: str    # Required: HH:MM format
+
+class ArrivalTimelineItem(BaseModel):
+    """Timeline item for flight arrivals."""
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["arrival"]
+    title: str
+    description: str = ""
+    time: str  # Single time field for arrivals
+
+class CheckInTimelineItem(BaseModel):
+    """Timeline item for hotel check-in."""
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["check_in"]
+    title: str
+    description: str = ""
+
+class CheckOutTimelineItem(BaseModel):
+    """Timeline item for hotel check-out."""
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["check_out"]
+    title: str
+    description: str = ""
+
+class TransferTimelineItem(BaseModel):
+    """Timeline item for transfers."""
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["transfer"]
+    title: str
+    description: str = ""
+    start_time: str | None = None
+    end_time: str | None = None
+    duration_minutes: int | None = None
+    transport_mode: TransportMode | None = None
+
+# Union type for all timeline items
+DayTimelineItem = (
+    ActivityTimelineItem
+    | ArrivalTimelineItem
+    | CheckInTimelineItem
+    | CheckOutTimelineItem
+    | TransferTimelineItem
+)
+
+def _is_hhmm(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    v = value.strip()
+    if len(v) != 5 or v[2] != ":":
+        return False
+    hh, mm = v.split(":", 1)
+    return hh.isdigit() and mm.isdigit() and 0 <= int(hh) <= 23 and 0 <= int(mm) <= 59
+
+
+def _infer_end_time(start_time: str, *, minutes: int = 120) -> str:
+    """Infer an end time HH:MM by adding a default duration to start_time."""
+    try:
+        dt = datetime.strptime(start_time.strip(), "%H:%M")
+        dt2 = dt + timedelta(minutes=minutes)
+        return dt2.strftime("%H:%M")
+    except Exception:
+        return "12:00"
+
+
+def _to_hhmm(value: Any, *, default: str = "09:00") -> str:
+    """Best-effort convert a value (HH:MM, ISO datetime, etc.) to HH:MM."""
+    if isinstance(value, str):
+        v = value.strip()
+        if _is_hhmm(v):
+            return v
+        # Try ISO / other datetime strings using FlexibleDateTime
+        dt = FlexibleDateTime.parse(v)
+        if dt is not None:
+            return dt.strftime("%H:%M")
+    dt = FlexibleDateTime.parse(value)
+    if dt is not None:
+        return dt.strftime("%H:%M")
+    return default
+
+
+def _normalize_day_timeline_item(item: Any) -> DayTimelineItem | None:
+    """Normalize a raw timeline item dict into the strict Pydantic models.
+
+    This is intentionally defensive because LLM output often includes:
+    - extra keys (e.g., transport_mode=None on activity items)
+    - missing required keys (e.g., end_time on activity items)
+
+    We sanitize the dict first to satisfy `extra="forbid"` schemas.
+    """
+    # If it's already a validated model, keep it
+    if isinstance(
+        item,
+        (
+            ActivityTimelineItem,
+            ArrivalTimelineItem,
+            CheckInTimelineItem,
+            CheckOutTimelineItem,
+            TransferTimelineItem,
+        ),
+    ):
+        return item
+
+    if not isinstance(item, dict):
+        return None
+
+    item_type = item.get("type")
+
+    if item_type == "activity":
+        start = _to_hhmm(item.get("start_time") or item.get("time"), default="10:00")
+        end = _to_hhmm(item.get("end_time"), default=_infer_end_time(start))
+        # EXACTLY 5 keys for ActivityTimelineItem (no extras, no null extras)
+        clean = {
+            "type": "activity",
+            "title": (item.get("title") or item.get("attraction") or "").strip(),
+            "description": (item.get("description") or "").strip(),
+            "start_time": start,
+            "end_time": end,
+        }
+        return ActivityTimelineItem.model_validate(clean)
+
+    if item_type == "arrival":
+        clean = {
+            "type": "arrival",
+            "title": (item.get("title") or "Flight Arrival").strip(),
+            "description": (item.get("description") or "").strip(),
+            "time": _to_hhmm(item.get("time") or item.get("arrival_time"), default="09:00"),
+        }
+        return ArrivalTimelineItem.model_validate(clean)
+
+    if item_type == "check_in":
+        clean = {
+            "type": "check_in",
+            "title": (item.get("title") or "Hotel Check-in").strip(),
+            "description": (item.get("description") or "").strip(),
+        }
+        return CheckInTimelineItem.model_validate(clean)
+
+    if item_type == "check_out":
+        clean = {
+            "type": "check_out",
+            "title": (item.get("title") or "Hotel Check-out").strip(),
+            "description": (item.get("description") or "").strip(),
+        }
+        return CheckOutTimelineItem.model_validate(clean)
+
+    if item_type == "transfer":
+        # Keep only allowed keys; drop everything else to satisfy extra="forbid"
+        clean = {
+            "type": "transfer",
+            "title": (item.get("title") or "Transfer").strip(),
+            "description": (item.get("description") or "").strip(),
+            "start_time": item.get("start_time"),
+            "end_time": item.get("end_time"),
+            "duration_minutes": item.get("duration_minutes"),
+            "transport_mode": item.get("transport_mode"),
+        }
+        return TransferTimelineItem.model_validate(clean)
+
+    # Unknown timeline items are dropped (safer with strict unions + extra=forbid)
+    return None
 
 # ----------------------------
 # Day + City itinerary
@@ -709,15 +1048,20 @@ class DayPlan(BaseModel):
     day: int
     label: str
     lead: str
-    date: str  # you have "10 March 2026" (not ISO) -> keep as string
+    full_day_plan: List[DayTimelineItem] = Field(default_factory=list)
+    date: str 
+    hotels: Dict[str, Any] = Field(default_factory=dict)
+    flights: Dict[str, Any] = Field(default_factory=dict)
+    transfers: Dict[str, Any] = Field(default_factory=dict)
 
-    # Keys like "Hotel 1", "Flight 1", "Transfer 1"
-    hotels: Dict[str, Hotel] = Field(default_factory=dict)
-    flights: Dict[str, Flight] = Field(default_factory=dict)
-    transfers: Dict[str, Transfer] = Field(default_factory=dict)
-
-    activities: List[Activity] = Field(default_factory=list)
-
+    @field_validator("full_day_plan", mode="before")
+    @classmethod
+    def _normalize_full_day_plan(cls, v: Any) -> Any:
+        if v is None:
+            return []
+        if not isinstance(v, list):
+            return v
+        return [x for x in (_normalize_day_timeline_item(item) for item in v) if x is not None]
 
 class CityItinerary(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -725,7 +1069,7 @@ class CityItinerary(BaseModel):
     city_name: str
     start_date: date
     end_date: date
-    duration: str  # "4 Nights", "5 Nights"
+    duration: str 
     days: List[DayPlan]
 
 
@@ -753,68 +1097,61 @@ class ItineraryPlan(BaseModel):
     itinerary: List[CityItinerary]
     costing: Costing
 
-class TravelPackage(BaseModel):
-    title: Optional[str] = None
-    days: Optional[str] = None
-    price: Optional[str] = None
-    tumbnail: Optional[str] = None
-    prompt: Optional[str] = None
-    packageId: Optional[str] = None
-
-    def to_dict(self) -> dict[str, Optional[str]]:
-        if hasattr(self, "model_dump"):
-            return self.model_dump()
-        return self.dict()
-
-        
-
-# Valid roles for conversation
-Role = Literal["user", "assistant", "system"]
-
-
-class ConversationMessage(TypedDict):
-    role: Role
-    content: str
-
 
 # Main state - everything the system knows
 class TripPlannerState(TypedDict, total=False):
     # Conversation tracking
     conversation_id: str
-    conversation_history: List[ConversationMessage]  # Full history
     current_phase: Phase
     version: int
-    
+
     # What changed in last message
     last_change_type: ChangeType
     changed_fields: List[str]
-    
+
     # User's core requirements (always small)
     core: CoreRequirements
+
+    # Track which services user actually requested (for partial trip support)
+    requested_services: Optional[List[Literal["flights", "hotels", "activities", "transfers"]]]
+
     flights_state: FlightsState
     hotels_state: HotelsState
     attractions_state: AttractionsState
     transfers_state: TransfersState
-    
+
     # The plans
     draft: DraftItinerary
     final_itinerary: ItineraryPlan
-    
+
+    # For RAG
+    similar_trips_ids: List[str]  # Just IDs, not full data
+
     # Current context for LLM (minimal)
-    current_context_from_intent_node_: str
-    
+    current_context: str
+
     # What nodes need to run
-    node_to_run: str
-    
+    nodes_to_run: List[str]
+
     # Conversation
     user_message: str
-    assistant_response: str
-    packages: Optional[List[TravelPackage]]
-    
+    assistant_response: str  # Final synthesized response from Trip Planner
+    # Back-compat / UI field name used by some modules
+    assistant_message: str
+    should_end_conversation: Optional[bool]
+    ended_at: Optional[str]  # ISO 8601
+
+    # Trip Planner memory / orchestration (owned by TripPlannerAgent)
+    trip_planner_history: List[TripPlannerConversationMessage]
+    trip_planner_queue: List[Literal["flights", "hotels", "activities", "transfers"]]
+    trip_planner_waiting_for_order: Optional[bool]
+    trip_planner_waiting_for_continue: Optional[bool]
+    trip_planner_active_agent: Optional[Literal["flights", "hotels", "activities", "transfers"]]
+    trip_planner_last_active_agent: Optional[Literal["flights", "hotels", "activities", "transfers"]]
+    trip_planner_collected_responses: Dict[str, str]
+
     # Errors
     errors: List[str]
-    
-    #packages from pre_curated_packages
-    packages: List[TravelPackage]
+
     # Internal routing
     _router_index: int
