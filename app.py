@@ -95,6 +95,7 @@ class ChatResponse(BaseModel):
     assistant_response: str
     intent: str
     errors: List[str] = []
+    final_itinerary: Optional[Any] = None
 
 
 class HealthResponse(BaseModel):
@@ -146,6 +147,7 @@ async def chat_endpoint(request: ChatRequest):
             assistant_response=result.get("assistant_response", ""),
             intent=result.get("node_to_run", ""),
             errors=result.get("errors", []),
+            final_itinerary=result.get("final_itinerary"),
         )
         
         logger.info(f"Response sent for conversation_id: {request.conversation_id}. Intent: {result.get('node_to_run', '')}")
