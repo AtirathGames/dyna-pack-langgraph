@@ -462,10 +462,10 @@ def trip_planner_node(state: TripPlannerState) -> Dict[str, Any]:
         result = api_response.json()
         
         logger.info(f"Trip Planner API successful. the response is : {result}")
-        
+
         # Extract fields as requested
-        # Note: API returns 'final_itenary' (sic)
-        final_itinerary = result.get("final_itenary", {})
+        # Note: API may return either 'final_itinerary' or 'final_itenary' (legacy typo)
+        final_itinerary = result.get("final_itinerary") or result.get("final_itenary", {})
         assistant_response = result.get("assistant_response", "Here is your trip plan!")
         
     except Exception as e:
