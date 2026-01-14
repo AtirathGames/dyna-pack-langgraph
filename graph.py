@@ -601,7 +601,7 @@ def pre_curated_package_node(state: TripPlannerState) -> Dict[str, Any]:
     try:
         # Call external API
         logger.info(f"Calling Package API at http://localhost:8001/v1/package-response payload :{payload}")
-        api_response = requests.post("http://localhost:8001/v1/package-response", json=payload)
+        api_response = requests.post("http://136.114.185.99:8001/v1/package-response", json=payload)
         api_response.raise_for_status()
         result = api_response.json()
         
