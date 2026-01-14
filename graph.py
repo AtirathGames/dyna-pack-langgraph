@@ -19,7 +19,7 @@ import requests
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from langchain.agents import create_agent
 from langchain.agents.structured_output import ProviderStrategy
 
@@ -106,9 +106,9 @@ VALID_INTENTS = [INTENT_EXPLORATION, INTENT_TRIP_PLANNER, INTENT_PRE_CURATED]
 # =============================================================================
 
 def _build_conversation_context(state: TripPlannerState) -> str:
-    """Build context string from state for LLM prompts."""
+    """Build context string from state for LLM prompts (excludes conversation history)."""
     context_parts = []
-    
+
     # Core requirements
     core = state.get("core", [])
     if core:
@@ -126,29 +126,37 @@ def _build_conversation_context(state: TripPlannerState) -> str:
                 context_parts.append(f"  - Budget: {req.get('budget_total')}")
             if req.get("travelers"):
                 context_parts.append(f"  - Travelers: {req.get('travelers')}")
-    
+
     # Current phase
     phase = state.get("current_phase")
     if phase:
         context_parts.append(f"\nCurrent Phase: {phase}")
-    
+
     # Draft itinerary
     draft = state.get("draft")
     if draft and draft.get("summary"):
         context_parts.append(f"\nDraft Summary: {draft.get('summary')}")
-    
-    # Conversation History (Last 5 turns for context)
-    history = state.get("conversation_history", [])
-    if history:
-        context_parts.append("\nReference Conversation History:")
-        # Get last 10 messages to keep context window manageable
-        recent_history = history[-10:]
-        for msg in recent_history:
-            role = msg.get("role", "unknown")
-            content = msg.get("content", "")
-            context_parts.append(f"{role.upper()}: {content}")
-            
+
+    # Note: Conversation history is now sent as separate messages, not in context
+
     return "\n".join(context_parts) if context_parts else "No prior context."
+
+
+def _get_history_messages(state: TripPlannerState, limit: int = 6) -> list:
+    """Get the last N messages from conversation history as message objects."""
+    history = state.get("conversation_history", [])
+    recent_history = history[-limit:] if history else []
+
+    messages = []
+    for msg in recent_history:
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        if role == "user":
+            messages.append(HumanMessage(content=content))
+        else:
+            messages.append(AIMessage(content=content))
+
+    return messages
 
 
 # =============================================================================
@@ -172,11 +180,10 @@ def intent_router_node(state: TripPlannerState) -> Dict[str, Any]:
     
     classification_prompt = f"""You are an intent classifier + intelligent router for a travel planning chatbot.
 
-CONVERSATION CONTEXT (includes dialogue + any stored state/notes if present):
+STATE CONTEXT:
 {context}
 
-CURRENT USER MESSAGE:
-{user_message}
+CURRENT STATE CORE:
 core: {core}
 
 YOUR JOB:
@@ -208,6 +215,7 @@ Route here when:
 - Core agenda likely NOT complete OR
 - User is still refining/confirming/editing trip inputs (even if some parameters exist) OR
 - User asks for recommendations to decide destinations/dates/budget/style, etc.
+- any edit and to fill missing core parameters  
 Exploration node responsibility: capture missing core parameters + run recommendation tool + confirm/modify parameters.
 - User want to change any core parameters 
 
@@ -253,11 +261,10 @@ Respond with ONLY a JSON object (no markdown). Use EXACTLY this schema:
 """
 
 
-    messages = [
-        SystemMessage(content=classification_prompt),
-        HumanMessage(content=user_message),
-    ]
-    
+    # Build messages: system prompt + last 6 history messages + current user message
+    history_messages = _get_history_messages(state, limit=6)
+    messages = [SystemMessage(content=classification_prompt)] + history_messages + [HumanMessage(content=user_message)]
+
     try:
         # Use structured output for robust parsing
         structured_llm = get_llm().with_structured_output(IntentOutput)
@@ -312,8 +319,12 @@ def exploration_node(state: TripPlannerState) -> Dict[str, Any]:
     draft_json = json.dumps(draft)
     
     system_prompt = f"""You are a friendly Travel Exploration Assistant. Your job is to help the user explore trip ideas *and* quickly converge on a confirmed plan with a solid draft itinerary.
+    responsibility: capture missing core parameters + run recommendation tool + confirm/modify parameters.
+    when filling the core parameters, always check if the core is already filled and if it is, skip it.
+    use fetch_live_packages tool to recommend packages to the user.when filling core parameters
+    so when tool is used and try to explain in the response why the package is recommended. if he likes the package take the core parameters from it and editing of package should not be done if any change try to fetch to see if it is possible if not try to make a draft itenary using core parameters
 
-CONTEXT:
+STATE CONTEXT:
 {context}
 
 CURRENT CORE:
@@ -326,17 +337,19 @@ GOALS
 1) Collect and confirm core trip parameters (as efficiently as possible):
    - origin
    - destination(s)
-   - date window (start_date, end_date or duration)
-   - total budget
-   - number of travelers
+   - start_date
+   - duration
+   - budget_total
+   - travelers
+   - type_of_trip
    - preferences (pace, interests, must-dos, food, accessibility, etc.) when relevant
-2) Answer travel FAQs using the knowledge base.
+2) Answer travel FAQs using the knowledge base.and get back with the hook question to complete your responsibility
 3) Provide live travel packages/deals  we can try to upsell package  or recommending packages upfront using the `fetch_live_packages` tool.
 4) After *every* meaningful new parameter (especially destination/date/budget/travelers), immediately:
-   - Generate/refresh a **draft itinerary** that best fits the CURRENT CORE using the knowledge base.
+   - Generate/refresh a **draft itinerary** that best fits the CURRENT CORE using the knowledge base or the `fetch_live_packages` tool.
    - Explain the itinerary in the response so the user can confirm or tweak quickly.
    - Use the itinerary to “bundle” questions (avoid one-question-per-turn).
-5) type_of_trip must be decided LAST, only after the user confirms the key core parameters and is happy with the draft:
+5) mandatory responsibility: type_of_trip must be decided LAST, only after the user confirms the key core parameters and is happy with the draft:
    - Ask the final “hook” question: whether they want a **dynamic** trip (flexible, exploring options) or a **curated** trip (locked-in plan with reservations/step-by-step schedule).
 
 DRAFT ITINERARY SCHEMA (use this structure for the "draft" field):
@@ -369,17 +382,15 @@ WHEN THE TASK IS “DONE”
   (b) a draft itinerary exists that the user approves, AND
   (c) you ask the final hook question about type_of_trip (dynamic vs curated).
 
-Respond with JSON:
+Respond with Valid JSON:
 {{"response": "your helpful message", "extracted_params": {{"destination": [...], "origin": null, "start_date": null, "end_date": null, "budget_total": null, "travelers": null,"type_of_trip": null}}, "draft": {draft_json}}}
 
 Always include all extracted_params fields. Use null for unmentioned parameters.
 If updating the draft, provide the FULL updated draft object, not just diffs."""
 
-    messages = [
-        SystemMessage(content=system_prompt),
-        HumanMessage(content=f"User: {user_message}"),
-    ]
-    
+    # Build messages: system prompt + last 6 history messages + current user message
+    history_messages = _get_history_messages(state, limit=6)
+
     try:
         # Use structured output for robust parsing
         agent = create_agent(
@@ -387,13 +398,65 @@ If updating the draft, provide the FULL updated draft object, not just diffs."""
             tools=[fetch_live_packages],
             response_format=ExplorationOutput,
         )
-        result = agent.invoke({
-    "messages": [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_message}
-    ]
-})
-        structured = result["structured_response"]
+
+        # Build message list for agent: system + history + current user
+        agent_messages = [{"role": "system", "content": system_prompt}]
+        for msg in history_messages:
+            if isinstance(msg, HumanMessage):
+                agent_messages.append({"role": "user", "content": msg.content})
+            else:
+                agent_messages.append({"role": "assistant", "content": msg.content})
+        agent_messages.append({"role": "user", "content": user_message})
+
+        result = agent.invoke({"messages": agent_messages})
+
+        # Debug: log the result structure
+        logger.debug(f"Agent result keys: {result.keys() if isinstance(result, dict) else type(result)}")
+        logger.debug(f"Agent result: {result}")
+
+        # Extract structured response from the result
+        structured = None
+
+        # Check if structured_response is directly in result
+        if isinstance(result, dict) and "structured_response" in result:
+            structured = result["structured_response"]
+        # Check for messages in result
+        elif isinstance(result, dict) and "messages" in result:
+            last_message = result["messages"][-1]
+            logger.debug(f"Last message type: {type(last_message)}, attrs: {dir(last_message)}")
+
+            # Check for parsed attribute (structured output)
+            if hasattr(last_message, "parsed") and last_message.parsed is not None:
+                structured = last_message.parsed
+            # Check for tool_calls or additional_kwargs with parsed data
+            elif hasattr(last_message, "additional_kwargs"):
+                kwargs = last_message.additional_kwargs
+                logger.debug(f"additional_kwargs: {kwargs}")
+                if "parsed" in kwargs:
+                    structured = kwargs["parsed"]
+
+            # Try to extract from content if still no structured output
+            if structured is None and hasattr(last_message, "content"):
+                content = last_message.content
+                logger.debug(f"Message content: {content[:500] if content else 'empty'}")
+                if content and isinstance(content, str) and content.strip():
+                    # Try to parse as JSON
+                    try:
+                        parsed_json = json.loads(content)
+                        structured = ExplorationOutput(**parsed_json)
+                    except json.JSONDecodeError:
+                        # Content is not JSON, use it as the response directly
+                        logger.warning(f"Content is not JSON, using as plain response")
+                        structured = ExplorationOutput(
+                            response=content,
+                            extracted_params=ExtractedParams(),
+                            draft=None
+                        )
+                elif content and isinstance(content, dict):
+                    structured = ExplorationOutput(**content)
+
+        if structured is None:
+            raise ValueError(f"Could not extract structured response. Result: {result}")
         
         assistant_response = structured.response
         extracted = structured.extracted_params.model_dump(exclude_none=True)

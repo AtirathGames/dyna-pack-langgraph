@@ -1138,6 +1138,7 @@ class TripPlannerState(TypedDict, total=False):
     assistant_response: str  # Final synthesized response from Trip Planner
     # Back-compat / UI field name used by some modules
     assistant_message: str
+    conversation_history: List[Dict[str, str]]  # List of {role, content} messages
     should_end_conversation: Optional[bool]
     ended_at: Optional[str]  # ISO 8601
 
