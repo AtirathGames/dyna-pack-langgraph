@@ -221,7 +221,8 @@ Exploration node responsibility: capture missing core parameters + run recommend
 
 B) "trip_planner"
 Route here when:
-- User explicitly wants a dynamic itinerary / day-wise plan / schedule OR
+- this node will used when user is okay want dynamic itinerary which will create a real itinerary for the draft itinerary generated in the exploration node
+- User explicitly wants a dynamic itinerary when asked by agent OR in chat conversation
 - User explicitly chooses “dynamic itinerary” in the hook question OR
 - User wants to modify an existing itinerary (add/remove days, reorder places, add activities, change pace)
 - User is clearly past exploration and wants the full plan now.
