@@ -27,6 +27,7 @@ from langchain.agents.structured_output import ProviderStrategy
 from pydantic import BaseModel, Field
 from stategraph import TripPlannerState, Phase, DraftItinerary
 from query_qdrant import qdrant_pdf_search
+from live_packages_tool import fetch_live_packages
 from logger_config import setup_logger
 
 logger = setup_logger(__name__)
@@ -329,12 +330,13 @@ GOALS
    - total budget
    - number of travelers
    - preferences (pace, interests, must-dos, food, accessibility, etc.) when relevant
-2) Answer travel FAQs using the knowledge base (and then return to parameter collection/confirmation).
-3) After *every* meaningful new parameter (especially destination/date/budget/travelers), immediately:
+2) Answer travel FAQs using the knowledge base.
+3) Provide live travel packages/deals  we can try to upsell package  or recommending packages upfront using the `fetch_live_packages` tool.
+4) After *every* meaningful new parameter (especially destination/date/budget/travelers), immediately:
    - Generate/refresh a **draft itinerary** that best fits the CURRENT CORE using the knowledge base.
    - Explain the itinerary in the response so the user can confirm or tweak quickly.
    - Use the itinerary to “bundle” questions (avoid one-question-per-turn).
-4) type_of_trip must be decided LAST, only after the user confirms the key core parameters and is happy with the draft:
+5) type_of_trip must be decided LAST, only after the user confirms the key core parameters and is happy with the draft:
    - Ask the final “hook” question: whether they want a **dynamic** trip (flexible, exploring options) or a **curated** trip (locked-in plan with reservations/step-by-step schedule).
 
 DRAFT ITINERARY SCHEMA (use this structure for the "draft" field):
@@ -381,11 +383,10 @@ If updating the draft, provide the FULL updated draft object, not just diffs."""
     try:
         # Use structured output for robust parsing
         agent = create_agent(
-    model=get_llm(),
-    tools=[],  # no tools needed here (Qdrant already handled outside)
-    response_format=ExplorationOutput,
-        
-)
+            model=get_llm(),
+            tools=[fetch_live_packages],
+            response_format=ExplorationOutput,
+        )
         result = agent.invoke({
     "messages": [
         {"role": "system", "content": system_prompt},
@@ -442,65 +443,65 @@ def trip_planner_node(state: TripPlannerState) -> Dict[str, Any]:
     Uses collected parameters to create comprehensive plans.
     """
     user_message = state.get("user_message", "")
-    context = _build_conversation_context(state)
-    intent_context = state.get("current_context_from_intent_node_", "")
     errors = list(state.get("errors", []))
-    core = state.get("core", [{}])
-    draft = state.get("draft", {})
     
-    
-    # Ensure all core parameters are present, defaulting to None
-    core_data = core[0] if core and isinstance(core, list) else {}
-    hydrated_core = {
-        "destination": core_data.get("destination"),
-        "origin": core_data.get("origin"),
-        "start_date": core_data.get("start_date"),
-        "end_date": core_data.get("end_date"),
-        "budget_total": core_data.get("budget_total"),
-        "travelers": core_data.get("travelers"),
-        "type_of_trip": core_data.get("type_of_trip")
-    }
+    # List of fields to synchronize with the external API
+    fields_to_sync = [
+        "core", "flights_state", "hotels_state", "attractions_state", "transfers_state",
+        "draft", "final_itinerary", "user_message", "assistant_response", "assistant_message",
+        "should_end_conversation", "ended_at", "trip_planner_history", "trip_planner_queue",
+        "trip_planner_waiting_for_order", "trip_planner_waiting_for_continue",
+        "trip_planner_active_agent", "trip_planner_last_active_agent",
+        "trip_planner_collected_responses"
+    ]
     
     # Prepare payload for API
-    payload = {
-        "core": hydrated_core,
-        "draft": draft,
-        "user_message": user_message
-    }
+    payload = {field: state.get(field) for field in fields_to_sync}
     
     try:
         # Call external API
-        logger.info(f"Calling Trip Planner API at http://35.200.247.133:8002/chat for conversation {state.get('conversation_id', 'unknown')} payload :{payload}")
+        logger.info(f"Calling Trip Planner API at http://35.200.247.133:8002/chat for conversation {state.get('conversation_id', 'unknown')}")
         api_response = requests.post("http://35.200.247.133:8002/chat", json=payload)
         api_response.raise_for_status()
         result = api_response.json()
         
-        logger.info(f"Trip Planner API successful. the response is : {result}")
+        logger.info(f"Trip Planner API successful.")
+        
+        # Start with a base update
+        update_data = {
+            "current_phase": Phase.DRAFTING,
+            "errors": errors
+        }
+        
+        # Update from API response for all synced fields
+        for field in fields_to_sync:
+            if field in result:
+                update_data[field] = result[field]
+        
+        # Handle legacy typo if final_itinerary is missing but final_itenary is present
+        if "final_itinerary" not in update_data and "final_itenary" in result:
+            update_data["final_itinerary"] = result["final_itenary"]
 
-        # Extract fields as requested
-        # Note: API may return either 'final_itinerary' or 'final_itenary' (legacy typo)
-        final_itinerary = result.get("final_itinerary") or result.get("final_itenary", {})
-        assistant_response = result.get("assistant_response", "Here is your trip plan!")
+        # Ensure assistant_response is updated for history tracking
+        assistant_response = update_data.get("assistant_response", "Here is your trip plan!")
         
     except Exception as e:
         logger.error(f"Trip planner API error: {str(e)}", exc_info=True)
         errors.append(f"Trip planner API error: {str(e)}")
         assistant_response = "I'm having trouble connecting to the planner service. Please try again."
-        final_itinerary = {}
+        update_data = {
+            "assistant_response": assistant_response,
+            "errors": errors
+        }
     
     # Update conversation history
     new_history = state.get("conversation_history", []) + [
         {"role": "user", "content": user_message},
         {"role": "assistant", "content": assistant_response}
     ]
+    update_data["conversation_history"] = new_history
 
-    return {
-        "assistant_response": assistant_response,
-        "final_itinerary": final_itinerary,
-        "current_phase": Phase.DRAFTING,
-        "errors": errors,
-        "conversation_history": new_history
-    }
+    return update_data
 
 
 def pre_curated_package_node(state: TripPlannerState) -> Dict[str, Any]:
